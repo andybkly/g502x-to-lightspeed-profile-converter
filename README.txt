@@ -24,6 +24,22 @@ SAFETY
 The selected source database is read-only. The converter creates a separate
 copy and runs SQLite's integrity check before reporting success.
 
+VERSION 1.1
+Copies saved profile assignments and removes the LIGHTSPEED persistent-assignment
+override so G Hub can apply each profile when its game or application activates.
+
+VERSION 1.1.1
+Fixes a PowerShell object-serialization failure in the Windows wrapper.
+
+VERSION 1.1.2
+Writes one consolidated database in SQLite DELETE journal mode, cleans temporary
+WAL/SHM files and retains readable JSON formatting.
+
+VERSION 1.2.0
+Never opens the original database through SQLite. Inspection occurs on an isolated
+temporary copy, all temporary sidecars are removed, and compact JSON prevents
+unnecessary database expansion.
+
 SHARING
 Share the complete ZIP, not individual files. Recipients should extract it
 before double-clicking the launcher. The PowerShell source is included so the

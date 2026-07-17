@@ -57,6 +57,9 @@ public static class WinSqlite {
     public static void WriteData(string path, long id, byte[] data) {
         IntPtr db = Open(path, OPEN_READWRITE), stmt = IntPtr.Zero;
         try {
+            // Produce one portable database file rather than leaving changes in
+            // SQLite WAL/SHM sidecars beside it.
+            Execute(db, "PRAGMA journal_mode=DELETE");
             Execute(db, "BEGIN IMMEDIATE");
             stmt = Prepare(db, "UPDATE DATA SET FILE=? WHERE _id=?");
             if (sqlite3_bind_blob(stmt, 1, data, data.Length, TRANSIENT) != OK || sqlite3_bind_int64(stmt, 2, id) != OK)
@@ -69,7 +72,11 @@ public static class WinSqlite {
     }
     static void Execute(IntPtr db, string sql) {
         IntPtr stmt = Prepare(db, sql);
-        try { int rc = sqlite3_step(stmt); if (rc != DONE && rc != ROW) throw new Exception("SQLite error: " + Error(db)); }
+        try {
+            int rc;
+            do { rc = sqlite3_step(stmt); } while (rc == ROW);
+            if (rc != DONE) throw new Exception("SQLite error: " + Error(db));
+        }
         finally { sqlite3_finalize(stmt); }
     }
     public static string IntegrityCheck(string path) {
@@ -88,6 +95,7 @@ function Show-Error([string]$Message) {
     [System.Windows.Forms.MessageBox]::Show($Message, 'G502 X Profile Converter', 'OK', 'Error') | Out-Null
 }
 
+$workingCopy = $null
 try {
     $open = New-Object System.Windows.Forms.OpenFileDialog
     $open.Title = 'Select your LGHUB settings.db (close G Hub first)'
@@ -97,8 +105,16 @@ try {
     if ($open.ShowDialog() -ne 'OK') { exit 0 }
     $source = $open.FileName
 
+    # Never open the user's original through SQLite. A read-only connection to a
+    # WAL-mode database can still create .shm/.wal coordination files beside it.
+    $workingCopy = Join-Path ([IO.Path]::GetTempPath()) ("G502X-Profile-Converter-" + [Guid]::NewGuid().ToString('N') + '.db')
+    Copy-Item -LiteralPath $source -Destination $workingCopy -Force
     [long]$rowId = 0
-    $bytes = [WinSqlite]::ReadData($source, [ref]$rowId)
+    $bytes = [WinSqlite]::ReadData($workingCopy, [ref]$rowId)
+    foreach ($temporaryFile in @($workingCopy, $workingCopy + '-wal', $workingCopy + '-shm', $workingCopy + '-journal')) {
+        if (Test-Path -LiteralPath $temporaryFile) { Remove-Item -LiteralPath $temporaryFile -Force }
+    }
+    $workingCopy = $null
     $jsonText = [Text.Encoding]::UTF8.GetString($bytes)
     $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
     $serializer.MaxJsonLength = [int]::MaxValue
@@ -112,12 +128,9 @@ try {
     $assignmentCount = 0
     foreach ($profile in $root['profiles']['profiles']) {
         if (-not $profile.ContainsKey('assignments')) { continue }
-        $assignmentList = New-Object System.Collections.ArrayList
-        [void]$assignmentList.AddRange([object[]]$profile['assignments'])
-        $profile['assignments'] = $assignmentList
         $wired = @{}
         $wireless = @{}
-        foreach ($assignment in $assignmentList) {
+        foreach ($assignment in $profile['assignments']) {
             if (-not $assignment.ContainsKey('slotId')) { continue }
             $slot = [string]$assignment['slotId']
             if ($slot.StartsWith('g502x-lightspeed_')) { $wireless[$slot.Substring(17)] = $assignment }
@@ -133,14 +146,23 @@ try {
                     $target['cardId'] = $sourceAssignment['cardId']; $changed++
                 }
             } else {
-                $newAssignment = @{}
-                foreach ($key in $sourceAssignment.Keys) { $newAssignment[$key] = $sourceAssignment[$key] }
-                $newAssignment['slotId'] = 'g502x-lightspeed_' + $suffix
-                [void]$assignmentList.Add($newAssignment)
-                $changed++
+                throw "Profile '$($profile['name'])' has no matching LIGHTSPEED slot for '$suffix'. Connect both mice and let G Hub initialise them first."
             }
         }
         if ($changed -gt 0) { $profileCount++; $assignmentCount += $changed }
+    }
+
+    # Remove target slots from G Hub's persistent-assignment override. If these
+    # remain, the UI changes profiles but the physical mouse keeps Desktop inputs.
+    $unlockedCount = 0
+    if ($root.ContainsKey('persistent_features') -and $root['persistent_features'].ContainsKey('assignments')) {
+        $unlockedList = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($assignment in $root['persistent_features']['assignments']) {
+            $slot = if ($assignment.ContainsKey('slotId')) { [string]$assignment['slotId'] } else { '' }
+            if ($slot.StartsWith('g502x-lightspeed_')) { $unlockedCount++ }
+            else { $unlockedList.Add($assignment) }
+        }
+        $root['persistent_features']['assignments'] = $unlockedList.ToArray()
     }
 
     if ($assignmentCount -eq 0) {
@@ -163,13 +185,22 @@ try {
     }
 
     Copy-Item -LiteralPath $source -Destination $destination -Force
-    $convertedJson = $serializer.Serialize($root)
+    # Compact JSON avoids PowerShell expanding an 8 MB database to nearly 30 MB.
+    $convertedJson = ConvertTo-Json -InputObject $root -Depth 100 -Compress
     [WinSqlite]::WriteData($destination, $rowId, [Text.Encoding]::UTF8.GetBytes($convertedJson))
     $integrity = [WinSqlite]::IntegrityCheck($destination)
     if ($integrity -ne 'ok') { Remove-Item -LiteralPath $destination -Force; throw "The converted database failed validation: $integrity" }
+    foreach ($sidecar in @($destination + '-wal', $destination + '-shm')) {
+        if (Test-Path -LiteralPath $sidecar) { Remove-Item -LiteralPath $sidecar -Force }
+    }
 
-    [System.Windows.Forms.MessageBox]::Show("Conversion complete.`r`n`r`nUpdated $assignmentCount assignments across $profileCount profiles.`r`n`r`nCreated:`r`n$destination`r`n`r`nYour original database was not changed.", 'Conversion complete', 'OK', 'Information') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show("Conversion complete.`r`n`r`nUpdated $assignmentCount assignments across $profileCount profiles and removed $unlockedCount persistent overrides so automatic switching can apply them.`r`n`r`nCreated:`r`n$destination`r`n`r`nYour original database was not changed.", 'Conversion complete', 'OK', 'Information') | Out-Null
 } catch {
+    if ($workingCopy) {
+        foreach ($temporaryFile in @($workingCopy, $workingCopy + '-wal', $workingCopy + '-shm', $workingCopy + '-journal')) {
+            if (Test-Path -LiteralPath $temporaryFile) { Remove-Item -LiteralPath $temporaryFile -Force -ErrorAction SilentlyContinue }
+        }
+    }
     Show-Error ("Conversion failed. Your original database was not changed.`r`n`r`n" + $_.Exception.Message)
     exit 1
 }
